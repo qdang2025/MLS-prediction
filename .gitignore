@@ -1,5 +1,6 @@
-# Ignore all .RData files
+# Ignore all .RData files and .DS_Store files
 *.RData
+*.DS_Store
 
 # Ignore datasets and example code folders
 clean_datasets/
