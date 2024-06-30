@@ -1,0 +1,118 @@
+---
+title: "Filling gaps in events"
+author: "Quang Dang"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initial Setup
+
+Remove all existing objects if you want to rerun all chunks
+
+```{r cleanup}
+rm(list = ls())
+```
+
+
+## Load Dataset
+
+Load the raw events dataset from a specified path.
+
+```{r load-data}
+# Load the events dataset
+events <- read.csv("./datasets/events.csv")
+```
+
+## Filling time gaps
+
+Iterate through the dataset and fill the gaps between original timestamps with "No significant events" commentary
+
+Observation: 
+  - I noticed that the code runs into N/A coercion issues. I believe this is because ESPN tends to change their match commentary style from time to time.
+  - I still haven't found a more effective way to add timestamps. Any suggestion would be much appreciated.
+
+```{r iteratively-process-data, warning=FALSE}
+# Initialize the extended events list
+extended_events <- list()
+
+for (i in 1:(nrow(events) - 1)) {
+  current_event <- events[i, ]
+  extended_events[[length(extended_events) + 1]] <- current_event
+
+  if (events$Time[i] == "-") {
+    if (events$Time[i + 1] == "-" || grepl("\\+", events$Time[i + 1])) {
+      next # Skip iterations where the event marker is "-" and next is also "-" or a stoppage time
+    } else {
+      # Handling the case where the event starts with "-" followed by a numeric time
+      next_time <- as.numeric(sub("'", "", gsub("\\+.*", "", events$Time[i + 1])))
+      if (!is.na(next_time) && next_time > 1) {
+        for (t in 1:(next_time - 1)) {
+          filler_event <- current_event
+          filler_event$Time <- paste(t, "'", sep = "")
+          filler_event$Event <- "No significant event"
+          extended_events[[length(extended_events) + 1]] <- filler_event
+        }
+      }
+      next
+    }
+  }
+
+  # Parse current and next times, checking for stoppage notation
+  current_time <- as.numeric(sub("'", "", gsub("\\+.*", "", events$Time[i])))
+  next_time <- as.numeric(sub("'", "", gsub("\\+.*", "", events$Time[i + 1])))
+  is_next_stoppage <- grepl("\\+", events$Time[i + 1])
+
+  # Fill times normally unless it's a transition to stoppage
+  if (!is.na(current_time) && !is.na(next_time) &&
+        next_time > current_time + 1 && !is_next_stoppage) {
+    for (t in (current_time + 1):(next_time - 1)) {
+      filler_event <- current_event
+      filler_event$Time <- paste(t, "'", sep = "")
+      filler_event$Event <- "No significant event"
+      extended_events[[length(extended_events) + 1]] <- filler_event
+    }
+  }
+
+  # Handle transition to stoppage time at critical marks
+  if (is_next_stoppage && current_time < next_time && (next_time %in% c(45, 90, 105, 120))) {
+    for (t in (current_time + 1):next_time) {
+      filler_event <- current_event
+      filler_event$Time <- paste(t, "'", sep = "")
+      filler_event$Event <- "No significant event"
+      extended_events[[length(extended_events) + 1]] <- filler_event
+    }
+  }
+}
+
+# Add the last event unless it is a "-"
+if (events$Time[nrow(events)] != "-") {
+  extended_events[[length(extended_events) + 1]] <- events[nrow(events), ]
+}
+```
+
+## Convert the list back to a dataframe
+
+```{r list-to-dataframe}
+# Convert list back to dataframe
+extended_events_df <- do.call(rbind, extended_events)
+```
+
+## Write/Save the file to a specified path
+
+```{r write-csv-file}
+# Write the expanded events dataset
+write.csv(extended_events_df,
+  "./clean_datasets/expanded_events.csv",
+  row.names = FALSE
+)
+
+# Output a message
+cat(
+  "The events dataset has been expanded with missing timestamps filled
+  and saved to './clean_datasets/expanded_events.csv'.\n"
+)
+```

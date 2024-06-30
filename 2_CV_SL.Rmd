@@ -1,0 +1,398 @@
+---
+title: "Fitting data onto super learner and analysis"
+author: "Quang Dang"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initial Setup
+
+Remove all existing objects from the workspace to ensure a clean environment.
+
+```{r cleanup}
+rm(list = ls())
+```
+
+## Reproducibility
+
+Set a seed for reproducibility of results.
+
+```{r set-seed}
+set.seed(221)
+```
+
+## Load Required Packages
+
+Load (or install and load) all the necessary libraries used in this analysis.
+
+```{r load-or-download-lib, message=FALSE}
+# List of required packages
+required_packages <-
+  c(
+    "SuperLearner", "glmnet", "gam", "earth", "ranger",
+    "xgboost", "nnet", "ridge", "cvAUC", "dplyr", "ggplot2"
+  )
+
+# Function to check if a package is installed and install it if not
+check_and_install <- function(package) {
+  if (!package %in% rownames(installed.packages())) {
+    install.packages(package, dependencies = TRUE)
+  }
+  # Ensure the package is loaded
+  library(package, character.only = TRUE)
+}
+
+# Apply the function to each required package
+sapply(required_packages, check_and_install)
+```
+
+## Load Dataset
+
+Load the dataset from a specified path.
+
+```{r load-data}
+data <- read.csv("./clean_datasets/final_combined_events_with_scores.csv")
+```
+
+## Define Predictor Variables
+
+Setup predictor variables for the model.
+
+```{r setup-variables}
+X <- data.frame(
+  score_differential = data$score_differential,
+  time_left = data$Time_Left
+)
+```
+
+## Define Custom Learners
+
+Define custom learners for ridge and lasso regression using `glmnet`.
+
+```{r custom-learners}
+SL.ridge <- function(...) SL.glmnet(alpha = 0, ...)
+SL.lasso <- function(...) SL.glmnet(alpha = 1, ...)
+```
+
+## Define Super Learner Library
+
+Setup the Super Learner library of algorithms.
+
+```{r setup-sl-library}
+SL.library <- c(
+  "SL.ridge", "SL.lasso", "SL.gam",
+  "SL.earth", "SL.ranger", "SL.xgboost", "SL.nnet"
+)
+```
+
+## Cross-validation Control
+
+Define the cross-validation control parameters.
+
+```{r cv-control}
+cvControl <- list(V = 10, shuffle = FALSE)
+```
+
+## Fit the Super Learner
+
+Fit the Super Learner model using the defined settings.
+
+```{r fit-sl}
+sl <- SuperLearner(
+  Y = data$team_1_wins, X = X, SL.library = SL.library, verbose = TRUE,
+  method = "method.NNloglik", family = binomial(),
+  cvControl = cvControl, id = data$id
+)
+``` 
+
+## Analyze Model Coefficients
+
+Check and plot the coefficients of the Super Learner to see the weight of each learner.
+
+```{r model-coefficients}
+if (!is.null(sl$coef)) {
+  print(sort(sl$coef, decreasing = TRUE))
+  barplot(sl$coef,
+    main = "Weights of Super Learner Algorithms",
+    xlab = "Algorithms", ylab = "Weights", col = "blue"
+  )
+}
+```
+
+## Confidence Intervals for CV-AUC
+
+Calculate and plot the confidence intervals for the cross-validated AUC of each algorithm.
+
+```{r ci-cv-auc}
+alg.aucs <- lapply(1:ncol(sl$Z), function(col) {
+  auc <-
+    ci.cvAUC(
+      predictions = sl$Z[, col],
+      labels = data$team_1_wins, folds = sl$folds
+    )
+  data.frame(
+    Algorithm = sl$libraryNames[col],
+    AUC = auc$cvAUC, CI.lower = auc$ci[1], CI.upper = auc$ci[2]
+  )
+}) %>%
+  bind_rows()
+
+sl.auc <- cvAUC(predictions = sl$SL.predict, labels = data$team_1_wins)
+alg.aucs <- rbind(alg.aucs, data.frame(
+  Algorithm = "SL",
+  AUC = sl.auc$cvAUC, CI.lower = NA, CI.upper = NA
+))
+
+alg.aucs$Algorithm <- factor(alg.aucs$Algorithm,
+  levels = alg.aucs$Algorithm[order(alg.aucs$AUC)]
+)
+
+ggplot(alg.aucs, aes(y = Algorithm, xmin = CI.lower, xmax = CI.upper)) +
+  geom_errorbarh(height = 0.2) +
+  geom_point(aes(x = AUC)) +
+  theme_minimal() +
+  xlab("AUC") +
+  ylab("Algorithm")
+
+# Check for values AUC, CI.lower, and CI.upper
+summary(alg.aucs)
+```
+
+## Prepare raw/empirical probabilities
+
+This is computed by grouping entries with the same Time_Left and score_differential (given a certain combination of those two values), we find the probability that team_1 wins. 
+
+```{r empirical-probabilities}
+# Calculate empirical probabilities
+empirical_probabilities <- data %>%
+  dplyr::filter(score_differential >= 0) %>%
+  dplyr::group_by(Time_Left, score_differential) %>%
+  dplyr::summarise(
+    total = dplyr::n(),
+    wins = sum(team_1_wins == 1)
+  ) %>%
+  dplyr::mutate(empirical_probability = wins / total) %>%
+  dplyr::ungroup()
+
+# Debug: Print entries for a specific score differential value
+# specific_differential <- empirical_probabilities %>%
+#  dplyr::filter(score_differential == 2)
+
+# print(specific_differential)
+```
+
+## Create a grid of possible combinations of Time_Left and score_differential
+
+```{r feature-combination-grid}
+# Create a grid of all combinations for positive differentials
+time_left <- seq(from = 89, to = 0, by = -1)
+positive_differentials <-
+  seq(
+    from = 0,
+    to = max(data$score_differential[data$score_differential > 0]), by = 1
+  )
+prediction_grid <-
+  expand.grid(
+    score_differential = positive_differentials,
+    time_left = time_left
+  )
+
+# Predict probabilities using the components models
+predictions <- predict(sl, prediction_grid, onlySL = FALSE)$library.predict[, 7]
+
+prediction_grid$predicted_probability <- predictions
+```
+
+## Merge the raw probability with the grid
+
+```{r combined-data}
+# Merge empirical probabilities with prediction grid
+combined_data <- merge(prediction_grid, empirical_probabilities,
+  by.x = c("score_differential", "time_left"),
+  by.y = c("score_differential", "Time_Left"),
+  all.x = TRUE
+)
+
+print(combined_data)
+```
+
+## Plot the raw vs predicted probabilities for different differentials
+
+```{r raw-vs-predicted-plot}
+# Plotting using ggplot2
+ggplot(combined_data, aes(x = time_left)) +
+  geom_line(aes(y = predicted_probability), color = "black") +
+  geom_line(aes(y = empirical_probability), color = "red") +
+  facet_wrap(~score_differential, scales = "free_y", labeller = label_both) +
+  labs(
+    title = "Predicted vs Empirical
+    Probability of Winning by Score Differential",
+    x = "Time Remaining (minutes)", y = "Probability of Winning"
+  ) +
+  theme_minimal() +
+  theme(strip.text.x = element_text(size = 8, face = "bold"))
+```
+
+## Binning probabilities
+
+```{r binning-probabilities}
+combined_data <- combined_data %>%
+  mutate(predicted_prob_bin = cut(predicted_probability, breaks = seq(0, 1, by = 0.0000001), include.lowest = TRUE, right = FALSE))
+
+calibration_data <- combined_data %>%
+  dplyr::group_by(predicted_prob_bin) %>%
+  dplyr::summarise(
+    mean_predicted_probability = mean(predicted_probability),
+    average_empirical_probability = mean(empirical_probability, na.rm = TRUE),
+    count = dplyr::n() # This counts the number of observations per bin
+  )
+```
+
+## Plot the calibration plot
+
+```{r calibration-plot}
+# Create the calibration plot using ggplot2
+ggplot(
+  data = calibration_data,
+  aes(x = mean_predicted_probability, y = average_empirical_probability)
+) +
+  # Display the scatter plot points with varying sizes based on 'count'
+  geom_point(aes(size = count), color = "black") +
+  # Add a linear model line without confidence intervals
+  # geom_smooth(method = "lm", se = FALSE, color = "black") +
+  # Add an abline for perfect calibration (x=y)
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  # X-axis breaks and limits
+  scale_x_continuous(breaks = seq(0, 1, by = 0.2), limits = c(0, 1)) +
+  # Y-axis breaks and limits
+  scale_y_continuous(breaks = seq(0, 1, by = 0.2), limits = c(0, 1)) +
+  labs(
+    title = "Calibration plot for the Model",
+    x = "Mean Predicted Probability", y = "Average Empirical Probability"
+  ) +
+  theme_minimal() +
+  # Adjust plot theme
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```
+
+## Debug chunk
+
+```{r debug}
+# Define the values to search for
+search_differential <- 6 # Specify the score differential value
+search_time_left <- 0 # Specify the time left value
+
+# Filter the data to find rows that match the specified conditions
+# and get the index of these rows
+matching_indices <- which(data$score_differential == search_differential &
+                            data$Time_Left == search_time_left)
+
+# Print the indices
+print(matching_indices)
+```
+
+
+## Test chunk
+```{r test}
+# Create a grid of all possible combinations of time left and score differentials, including negative, zero, and positive differentials
+time_left <- seq(from = 89, to = 0, by = -1)
+differentials <- seq(from = min(data$score_differential), to = max(data$score_differential), by = 1)
+prediction_grid <- expand.grid(score_differential = differentials, time_left = time_left)
+
+# Predict probabilities for both positive and negative differentials
+positive_predictions <- predict(sl, prediction_grid, onlySL = FALSE)$library.predict[, 7]
+# For negative differentials, invert the 'score_differential' column temporarily to get the predictions for team 2's perspective
+prediction_grid$score_differential <- -prediction_grid$score_differential
+negative_predictions <- predict(sl, prediction_grid, onlySL = FALSE)$library.predict[, 7]
+
+# Map back the positive differentials for correct storage and computation
+prediction_grid$score_differential <- abs(prediction_grid$score_differential)
+
+# Calculate the tying probability
+prediction_grid$predicted_probability <- 1 - (positive_predictions + negative_predictions)
+
+# Now, store this in the entry of each combination of time left and positive score differential
+# Filter to avoid duplications from negative scores
+filtered_grid <- prediction_grid[prediction_grid$score_differential >= 0, ]
+#print(filtered_grid)
+```
+
+
+```{r test2}
+data$is_tie <- ifelse(data$home_score == data$away_score, 1, 0)
+
+# Calculate empirical tying probabilities
+empirical_tying_probabilities <- data %>%
+  group_by(Time_Left, score_differential) %>%
+  summarise(
+    total = n(),
+    ties = sum(is_tie, na.rm = TRUE)
+  ) %>%
+  mutate(empirical_tying_probability = ties / total) %>%
+  ungroup()
+
+# Filter out negative score differentials
+empirical_tying_probabilities <- empirical_tying_probabilities %>%
+  filter(score_differential >= 0)
+
+# Debug: Print entries for a specific score differential value
+#specific_differential_tying <- empirical_tying_probabilities %>%
+#  filter(score_differential == 2) # Adjust as needed for specific diagnostics
+
+#print(specific_differential_tying)
+
+# Merge empirical tying probabilities with prediction grid
+combined_tying_data <- merge(prediction_grid, empirical_tying_probabilities,
+  by.x = c("score_differential", "time_left"),
+  by.y = c("score_differential", "Time_Left"),
+  all.x = TRUE
+)
+
+# Debug: Print the combined data
+print(combined_tying_data)
+
+# Plotting the tying probabilities
+ggplot(combined_tying_data, aes(x = time_left)) +
+  geom_line(aes(y = predicted_probability), color = "black") +
+  geom_line(aes(y = empirical_tying_probability), color = "red") +
+  facet_wrap(~score_differential, scales = "free_y", labeller = label_both) +
+  labs(
+    title = "Predicted vs Empirical Tying Probability by Score Differential",
+    x = "Time Remaining (minutes)", y = "Tying Probability"
+  ) +
+  theme_minimal() +
+  theme(strip.text.x = element_text(size = 8, face = "bold"))
+
+
+# Binning tying probabilities
+combined_tying_data <- combined_tying_data %>%
+  mutate(predicted_prob_bin = cut(predicted_probability, breaks = seq(0, 1, by = 0.0000001), include.lowest = TRUE, right = FALSE))
+
+calibration_tying_data <- combined_tying_data %>%
+  group_by(predicted_prob_bin) %>%
+  summarise(
+    mean_predicted_probability = mean(predicted_probability),
+    average_empirical_probability = mean(empirical_tying_probability, na.rm = TRUE),
+    count = n() # This counts the number of observations per bin
+  )
+
+# Create the calibration plot for tying probabilities
+ggplot(
+  data = calibration_tying_data,
+  aes(x = mean_predicted_probability, y = average_empirical_probability)
+) +
+  geom_point(aes(size = count), color = "black") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.2), limits = c(0, 1)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.2), limits = c(0, 1)) +
+  labs(
+    title = "Calibration plot for Tying Probabilities",
+    x = "Mean Predicted Probability", y = "Average Empirical Probability"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```

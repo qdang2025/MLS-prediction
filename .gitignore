@@ -1,0 +1,8 @@
+# Ignore all .RData files
+*.RData
+
+# Ignore datasets and example code folders
+clean_datasets/
+datasets/
+example_code/
+plots/

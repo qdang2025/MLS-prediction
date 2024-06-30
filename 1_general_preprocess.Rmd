@@ -1,0 +1,194 @@
+---
+title: "Preprocess soccer matches and events data"
+author: "Quang Dang"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initial Setup
+
+Remove all existing objects from the workspace to ensure a clean environment.
+
+```{r cleanup}
+rm(list = ls())
+```
+
+## Load Required Packages
+
+Load all the necessary libraries used in this analysis.
+
+```{r load-datasets}
+# Load the matches and events datasets
+all_matches <- read.csv("./datasets/matches.csv")
+events <- read.csv("./clean_datasets/expanded_events.csv")
+```
+
+## Something interesting to note
+
+Calculate the percentage of matches from 2019 onwards
+
+```{r matches-percentage}
+total <- sum(all_matches$year >= 2019)
+percentage_recent <- total / nrow(all_matches) * 100
+print(paste("Number of matches from 2019 onwards:", total))
+print(paste("Percentage of matches from 2019 onwards:", percentage_recent))
+```
+
+## Select matches from 2019 onwards and select necessary columns
+
+```{r filter-and-select}
+selected_matches <- all_matches[all_matches$year >= 2019, ]
+selected_columns <- c(
+  "id", "home", "away", "date", "year", "home_score",
+  "away_score", "shootout"
+)
+matches <- selected_matches[selected_columns]
+```
+
+## Merge selected matches with the events
+
+```{r merge}
+events <- events[events$id %in% matches$id, ]
+
+# Temporary index to maintain original order after merge
+events$order_index <- seq_len(nrow(events))
+
+# Merge the filtered events with the matches data
+combined_data <- merge(events, matches, by = "id")
+
+# Sort by original event order
+combined_data <- combined_data[order(combined_data$order_index), ]
+```
+
+## Helper function to parse match time and calculate time left
+```{r time-helper}
+parse_time <- function(time_str) {
+  if (time_str == "-" || grepl("begins", time_str)) {
+    return(NA) # NA for events like "First half begins" or "Second Half begins"
+  }
+  stoppage_flag <- grepl("\\+", time_str)
+  parts <- strsplit(gsub("[^0-9+']", "", time_str), "\\+")[[1]]
+  time_passed <- as.numeric(sub("'", "", parts[1]))
+  if (stoppage_flag && length(parts) > 1) {
+    time_passed <- time_passed + as.numeric(parts[2]) # Add stoppage time
+  }
+  return(90 - time_passed) # Subtract from 90 to get time left
+}
+```
+
+## Process data
+
+```{r data-process-loop, warning=FALSE}
+# Initialize columns for running scores, time left, and score differential
+combined_data$team_1_running_score <- 0
+combined_data$team_2_running_score <- 0
+combined_data$score_differential <- 0
+combined_data$Time_Left <- NA # Initialize Time Left
+combined_data$duplicated_flag <- 0 # Flag for original data
+
+# Process each event to update running scores and calculate differentials
+current_id <- 0
+for (i in 1:nrow(combined_data)) {
+  combined_data$Time_Left[i] <- parse_time(combined_data$Time[i])
+  if (combined_data$id[i] != current_id) {
+    current_team_1_score <- 0
+    current_team_2_score <- 0
+    current_id <- combined_data$id[i]
+  }
+  if (grepl("Goal!", combined_data$Event[i]) ||
+    grepl("Own Goal by", combined_data$Event[i])) {
+    scores <- regmatches(
+      combined_data$Event[i],
+      regexec(".*?(\\d+),.*?(\\d+)", combined_data$Event[i])
+    )
+    if (length(scores[[1]]) == 3) {
+      current_team_1_score <- as.integer(scores[[1]][2])
+      current_team_2_score <- as.integer(scores[[1]][3])
+    }
+  }
+  combined_data$team_1_running_score[i] <- current_team_1_score
+  combined_data$team_2_running_score[i] <- current_team_2_score
+  combined_data$score_differential[i] <-
+    current_team_1_score - current_team_2_score
+}
+```
+
+## Define which team won, add flag columns, and perform replication
+
+Since we are replicating observations with non-zero differentials, we do not have to randomly choose observations and pick whether the home or away team is team_1
+
+```{r data-replication}
+# Define the team 1 won outcome
+# Ensure that team_1 refers to the home team
+# and we want to set 0 for any non-win outcome
+
+# combined_data$team_1_wins <-
+#   ifelse(combined_data$home_score > combined_data$away_score, 1,
+#     ifelse(combined_data$home_score == combined_data$away_score, 0,
+#       ifelse(combined_data$home_score < combined_data$away_score, 0, NA)
+#     )
+#   )
+
+combined_data$team_1_wins <-
+  ifelse(combined_data$home_score > combined_data$away_score, 1,
+    ifelse(combined_data$home_score == combined_data$away_score, 0, 0)
+  )
+
+# Duplicate entries with non-zero differential,
+# even if the final outcome is a draw
+non_zero_differential <- combined_data[combined_data$score_differential != 0, ]
+
+non_zero_differential$duplicated_flag <- 1 # Flag for duplicated data
+
+non_zero_differential$score_differential <-
+  -non_zero_differential$score_differential
+
+# Swap running scores
+temp_score <- non_zero_differential$team_1_running_score
+
+non_zero_differential$team_1_running_score <-
+  non_zero_differential$team_2_running_score
+
+non_zero_differential$team_2_running_score <- temp_score
+
+# Adjust the outcome based on new perspective
+# where the duplicated entry now has the away team as team_1
+# non_zero_differential$team_1_wins <-
+#   ifelse(non_zero_differential$team_1_running_score >
+#            non_zero_differential$team_2_running_score, 1, 0)
+
+# Adjust the outcome based on new perspective
+# where the duplicated entry now has the away team as team_1
+non_zero_differential$team_1_wins <-
+  ifelse(non_zero_differential$away_score > non_zero_differential$home_score, 1,
+    ifelse(non_zero_differential$away_score == non_zero_differential$home_score, 0, 0)
+  )
+
+# Append the modified entries back to the main dataset
+final_data <- rbind(combined_data, non_zero_differential)
+
+# Filter out invalid time_left entries (NA or negative values)
+final_data <-
+  final_data[!is.na(final_data$Time_Left) & final_data$Time_Left >= 0, ]
+
+# Order the final dataset to mix original and duplicated rows correctly
+final_data <- final_data[order(final_data$id, final_data$order_index), ]
+
+# Clean up and finalize the dataset
+final_data$order_index <- NULL
+```
+
+## Write the final dataset
+
+```{r save-new-data}
+write.csv(final_data, "./clean_datasets/final_combined_events_with_scores.csv",
+  row.names = FALSE
+)
+cat("The dataset has been prepared with time left calculations,
+duplicated events for non-zero differentials, and filtering of
+invalid time entries.")
+```
